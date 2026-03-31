@@ -11,7 +11,8 @@ B='\033[0;34m'    M='\033[0;35m'    C='\033[0;36m'
 W='\033[1;37m'    DIM='\033[2m'     RST='\033[0m'
 
 # ── Defaults ────────────────────────────────────────────────────────────────
-TARGET_DIR="/var"
+TARGET_DIR_RAW="/var"
+declare -a TARGET_DIRS=()
 PATTERN=""
 OUTFILE=""
 WORDLIST=""
@@ -74,7 +75,8 @@ usage() {
     echo "  credsniff.sh [options] -p PATTERN"
     echo ""
     echo -e "${W}Options:${RST}"
-    echo "  -d DIR        Target directory to scan (default: /var)"
+    echo "  -d DIR        Target directory (default: /var)"
+    echo "                  Use + for multiple subdirs: /var/mail+lib+www"
     echo "  -p PATTERN    Grep-E pattern (e.g. \"admin|root|password\")"
     echo "  -w FILE       Load patterns from wordlist (one per line)"
     echo "  -e EXTS       File extension filter, comma-sep (e.g. conf,php,txt,xml)"
@@ -88,6 +90,7 @@ usage() {
     echo "  credsniff.sh -p \"admin|root|password\""
     echo "  credsniff.sh -d /home -p \"charles|sam\" -e conf,txt,php"
     echo "  credsniff.sh -w users.txt -d /var -o loot.txt -F"
+    echo "  credsniff.sh -d /var/mail+lib+www -p \"admin|password\""
     echo "  credsniff.sh -d /etc -p \"db_pass|mysql\" -q"
     exit 0
 }
@@ -95,7 +98,7 @@ usage() {
 # ── Argument parsing ───────────────────────────────────────────────────────
 while getopts "d:p:o:w:e:t:qFh" opt; do
     case $opt in
-        d) TARGET_DIR="$OPTARG" ;;
+        d) TARGET_DIR_RAW="$OPTARG" ;;
         p) PATTERN="$OPTARG" ;;
         o) OUTFILE="$OPTARG" ;;
         w) WORDLIST="$OPTARG" ;;
@@ -127,10 +130,27 @@ if [[ -z "$PATTERN" ]]; then
     usage
 fi
 
-if [[ ! -d "$TARGET_DIR" ]]; then
-    echo -e "${R}[!] Error: $TARGET_DIR is not a directory or does not exist${RST}"
-    exit 1
+# ── Expand + syntax: /var/mail+lib+www → /var/mail /var/lib /var/www ───────
+if [[ "$TARGET_DIR_RAW" == *"+"* ]]; then
+    IFS='+' read -ra parts <<< "$TARGET_DIR_RAW"
+    base=$(dirname "${parts[0]}")
+    for part in "${parts[@]}"; do
+        if [[ "$part" == "${parts[0]}" ]]; then
+            TARGET_DIRS+=("$part")
+        else
+            TARGET_DIRS+=("${base}/${part}")
+        fi
+    done
+else
+    TARGET_DIRS=("$TARGET_DIR_RAW")
 fi
+
+for td in "${TARGET_DIRS[@]}"; do
+    if [[ ! -d "$td" ]]; then
+        echo -e "${R}[!] Error: $td is not a directory or does not exist${RST}"
+        exit 1
+    fi
+done
 
 # ── Build grep include args for extension filtering ────────────────────────
 INCLUDE_ARGS=()
@@ -237,21 +257,24 @@ main() {
         local pat_display="$PATTERN"
         [[ ${#pat_display} -gt 80 ]] && pat_display="${pat_display:0:77}..."
 
-        out " ${W}Target:${RST} ${C}${TARGET_DIR}${RST} | ${W}Pattern:${RST} ${C}${pat_display}${RST}${ext_display} | ${W}Threads:${RST} ${THREADS}"
+        local dir_display="${TARGET_DIRS[*]}"
+        out " ${W}Target:${RST} ${C}${dir_display}${RST} | ${W}Pattern:${RST} ${C}${pat_display}${RST}${ext_display} | ${W}Threads:${RST} ${THREADS}"
         [[ -n "$wl_display" ]] && out "$wl_display"
         [[ -n "$OUTFILE" ]] && out " ${W}Output:${RST} ${OUTFILE}"
         out ""
     fi
 
     local start_time=$(date +%s)
-    out "[$(ts)] Starting: ${C}${TARGET_DIR}${RST}"
+    for td in "${TARGET_DIRS[@]}"; do
+        out "[$(ts)] Starting: ${C}${td}${RST}"
+    done
 
     # ── Scan: Pattern matching ────────────────────────────────────────────
     local match_files
     if [[ ${#INCLUDE_ARGS[@]} -gt 0 ]]; then
-        match_files=$(grep -rlE "${INCLUDE_ARGS[@]}" "$PATTERN" "$TARGET_DIR" 2>/dev/null | grep -v "Binary file")
+        match_files=$(grep -rlE "${INCLUDE_ARGS[@]}" "$PATTERN" "${TARGET_DIRS[@]}" 2>/dev/null | grep -v "Binary file")
     else
-        match_files=$(grep -rlE "$PATTERN" "$TARGET_DIR" 2>/dev/null | grep -v "Binary file")
+        match_files=$(grep -rlE "$PATTERN" "${TARGET_DIRS[@]}" 2>/dev/null | grep -v "Binary file")
     fi
 
     if [[ -n "$match_files" ]]; then
@@ -276,7 +299,7 @@ main() {
 
     # ── Scan: Hash detection ──────────────────────────────────────────────
     local shadow_hashes
-    shadow_hashes=$(grep -rnoE '\$[0-9a-z]+\$[^\s:]{8,}' "$TARGET_DIR" 2>/dev/null | grep -v "Binary file" | head -30)
+    shadow_hashes=$(grep -rnoE '\$[0-9a-z]+\$[^\s:]{8,}' "${TARGET_DIRS[@]}" 2>/dev/null | grep -v "Binary file" | head -30)
 
     if [[ -n "$shadow_hashes" ]]; then
         while IFS= read -r line; do
@@ -298,7 +321,7 @@ main() {
     else
         # Try standalone hex hashes
         local hex_hashes
-        hex_hashes=$(grep -rnoEh '\b[a-fA-F0-9]{32,128}\b' "$TARGET_DIR" 2>/dev/null | grep -v "Binary file" | head -30)
+        hex_hashes=$(grep -rnoEh '\b[a-fA-F0-9]{32,128}\b' "${TARGET_DIRS[@]}" 2>/dev/null | grep -v "Binary file" | head -30)
 
         if [[ -n "$hex_hashes" ]]; then
             while IFS= read -r line; do
@@ -319,7 +342,7 @@ main() {
 
     # ── Scan: Base64 detection ────────────────────────────────────────────
     local b64_strings
-    b64_strings=$(grep -rnoEh '[A-Za-z0-9+/]{12,}={0,2}' "$TARGET_DIR" 2>/dev/null | \
+    b64_strings=$(grep -rnoEh '[A-Za-z0-9+/]{12,}={0,2}' "${TARGET_DIRS[@]}" 2>/dev/null | \
                   grep -v "Binary file" | sort -u | head -50)
 
     if [[ -n "$b64_strings" ]]; then
@@ -339,7 +362,7 @@ main() {
 
     # ── Scan: SSH keys ────────────────────────────────────────────────────
     local key_files
-    key_files=$(grep -rl "PRIVATE KEY" "$TARGET_DIR" 2>/dev/null)
+    key_files=$(grep -rl "PRIVATE KEY" "${TARGET_DIRS[@]}" 2>/dev/null)
 
     if [[ -n "$key_files" ]]; then
         while IFS= read -r kf; do
@@ -365,7 +388,10 @@ main() {
     fi
 
     # ── Scan: Mail ────────────────────────────────────────────────────────
-    local mail_dirs=("${TARGET_DIR}/mail" "${TARGET_DIR}/spool/mail")
+    local mail_dirs=()
+    for td in "${TARGET_DIRS[@]}"; do
+        mail_dirs+=("${td}/mail" "${td}/spool/mail")
+    done
 
     for mdir in "${mail_dirs[@]}"; do
         [[ ! -d "$mdir" ]] && continue
