@@ -20,6 +20,7 @@ EXTENSIONS=""
 THREADS=10
 QUIET=0
 FULL_REPORT=0
+HISTORY_MODE=0
 FOUND_COUNT=0
 FILES_SCANNED=0
 
@@ -47,6 +48,7 @@ finding() {
         B64)   color="$M" ;;
         KEY)   color="$R" ;;
         MAIL)  color="$C" ;;
+        HIST)  color="$Y" ;;
         MATCH) color="$G" ;;
         *)     color="$W" ;;
     esac
@@ -82,6 +84,7 @@ usage() {
     echo "  -e EXTS       File extension filter, comma-sep (e.g. conf,php,txt,xml)"
     echo "  -o FILE       Save report to file"
     echo "  -t NUM        Parallel grep threads (default: 10)"
+    echo "  -H            History mode — hunt history files for credential-leaking commands"
     echo "  -q            Quiet mode — findings only, no banner"
     echo "  -F            Full report — append detailed breakdown at end"
     echo "  -h            Show this help"
@@ -92,11 +95,12 @@ usage() {
     echo "  credsniff.sh -w users.txt -d /var -o loot.txt -F"
     echo "  credsniff.sh -d /var/mail+lib+www -p \"admin|password\""
     echo "  credsniff.sh -d /etc -p \"db_pass|mysql\" -q"
+    echo "  credsniff.sh -H -p \"charles\"          hunt histories for charles"
     exit 0
 }
 
 # ── Argument parsing ───────────────────────────────────────────────────────
-while getopts "d:p:o:w:e:t:qFh" opt; do
+while getopts "d:p:o:w:e:t:HqFh" opt; do
     case $opt in
         d) TARGET_DIR_RAW="$OPTARG" ;;
         p) PATTERN="$OPTARG" ;;
@@ -104,6 +108,7 @@ while getopts "d:p:o:w:e:t:qFh" opt; do
         w) WORDLIST="$OPTARG" ;;
         e) EXTENSIONS="$OPTARG" ;;
         t) THREADS="$OPTARG" ;;
+        H) HISTORY_MODE=1 ;;
         q) QUIET=1 ;;
         F) FULL_REPORT=1 ;;
         h) usage ;;
@@ -125,8 +130,8 @@ if [[ -n "$WORDLIST" ]]; then
     fi
 fi
 
-if [[ -z "$PATTERN" ]]; then
-    echo -e "${R}[!] Error: -p PATTERN or -w WORDLIST is required${RST}"
+if [[ -z "$PATTERN" && $HISTORY_MODE -eq 0 ]]; then
+    echo -e "${R}[!] Error: -p PATTERN, -w WORDLIST, or -H required${RST}"
     usage
 fi
 
@@ -220,6 +225,7 @@ extract_cred_context() {
         if [[ ! "$u" =~ ^(http|https|ftp|ssh|tcp|udp|localhost|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)$ ]]; then
             if [[ ! "$p" =~ ^(/|0x|var|bin|lib|usr|etc|dev|tmp|proc|sys|sbin) ]]; then
                 CRED_PAIRS+=("${file}|${u}|${p}")
+                finding "CRED" "${u}:${p}" "${file}"
             fi
         fi
     fi
@@ -229,12 +235,15 @@ extract_cred_context() {
         local pw="${BASH_REMATCH[3]}"
         if [[ ${#pw} -ge 2 ]]; then
             CRED_PAIRS+=("${file}|password_field|${pw}")
+            finding "CRED" "password_field:${pw}" "${file}"
         fi
     fi
 
     # DB connection strings
     if [[ "$line" =~ (mysql|postgres|mongodb|redis)://([^:]+):([^@]+)@ ]]; then
-        CRED_PAIRS+=("${file}|${BASH_REMATCH[1]}://${BASH_REMATCH[2]}|${BASH_REMATCH[3]}")
+        local svc="${BASH_REMATCH[1]}" u="${BASH_REMATCH[2]}" p="${BASH_REMATCH[3]}"
+        CRED_PAIRS+=("${file}|${svc}://${u}|${p}")
+        finding "CRED" "${svc}://${u}:${p}" "${file}"
     fi
 }
 
@@ -268,6 +277,9 @@ main() {
     for td in "${TARGET_DIRS[@]}"; do
         out "[$(ts)] Starting: ${C}${td}${RST}"
     done
+
+    # ── Scans: Pattern-dependent (skipped if no pattern set) ─────────────
+    if [[ -n "$PATTERN" ]]; then
 
     # ── Scan: Pattern matching ────────────────────────────────────────────
     local match_files
@@ -422,6 +434,84 @@ main() {
             fi
         done <<< "$mfiles"
     done
+
+    fi # end pattern-dependent scans
+
+    # ── Scan: History hunting (-H) ────────────────────────────────────────
+    if [[ $HISTORY_MODE -eq 1 ]]; then
+        # Credential-leaking command patterns in shell history
+        local hist_pattern='sshpass[[:space:]]+-p|mysql[[:space:]].*-p[^[:space:]]|mysqladmin[[:space:]].*-p|curl[[:space:]].*(-u|--user)[[:space:]]+[^[:space:]]+:[^[:space:]]|wget[[:space:]].*(--password|--http-password)[=[:space:]][^[:space:]]|ftp[[:space:]].*:[^[:space:]]|export[[:space:]]+(PASSWORD|PASS|SECRET|TOKEN|KEY|API_KEY)[=[:space:]]|[Pp]ass(word)?[[:space:]]*=[[:space:]]*[^[:space:]]|--password[=[:space:]][^[:space:]]|-passwd[[:space:]]+[^[:space:]]|net[[:space:]]+use.*\/[Pp]:[^[:space:]]'
+
+        # Collect all readable history files
+        local hist_files=()
+        for f in \
+            /root/.bash_history \
+            /root/.zsh_history \
+            /root/.sh_history \
+            /home/*/.bash_history \
+            /home/*/.zsh_history \
+            /home/*/.sh_history \
+            /home/*/.local/share/fish/fish_history \
+            ~/.bash_history \
+            ~/.zsh_history; do
+            # glob expansion — only add readable files, no duplicates
+            [[ -f "$f" && -r "$f" ]] && hist_files+=("$f")
+        done
+
+        # Deduplicate via associative array
+        declare -A _seen_hist=()
+        declare -a unique_hist=()
+        for f in "${hist_files[@]}"; do
+            local real
+            real=$(realpath "$f" 2>/dev/null || echo "$f")
+            if [[ -z "${_seen_hist[$real]+x}" ]]; then
+                _seen_hist[$real]=1
+                unique_hist+=("$real")
+            fi
+        done
+
+        if [[ ${#unique_hist[@]} -eq 0 ]]; then
+            out "[$(ts)] ${DIM}HIST  - no readable history files found${RST}"
+        else
+            for hf in "${unique_hist[@]}"; do
+                local owner
+                owner=$(stat -c '%U' "$hf" 2>/dev/null || echo "?")
+
+                # Search for credential-leaking commands
+                local hits
+                hits=$(grep -nE "$hist_pattern" "$hf" 2>/dev/null)
+                if [[ -n "$hits" ]]; then
+                    while IFS= read -r hit; do
+                        [[ -z "$hit" ]] && continue
+                        local ln="${hit%%:*}"
+                        local cmd="${hit#*:}"
+                        cmd=$(echo "$cmd" | sed 's/^[[:space:]]*//')
+                        [[ ${#cmd} -gt 120 ]] && cmd="${cmd:0:117}..."
+                        finding "HIST" "${cmd}" "${hf}:${ln} (${owner})"
+                        extract_cred_context "$cmd" "$hf"
+                        ATTACK_PATHS+=("Review history: grep -n '.' ${hf}")
+                    done <<< "$hits"
+                fi
+
+                # Also grep for user pattern if provided
+                if [[ -n "$PATTERN" ]]; then
+                    local pat_hits
+                    pat_hits=$(grep -nE "$PATTERN" "$hf" 2>/dev/null)
+                    if [[ -n "$pat_hits" ]]; then
+                        while IFS= read -r hit; do
+                            [[ -z "$hit" ]] && continue
+                            local ln="${hit%%:*}"
+                            local cmd="${hit#*:}"
+                            cmd=$(echo "$cmd" | sed 's/^[[:space:]]*//')
+                            [[ ${#cmd} -gt 120 ]] && cmd="${cmd:0:117}..."
+                            finding "HIST" "${cmd}" "${hf}:${ln} (${owner})"
+                            extract_cred_context "$cmd" "$hf"
+                        done <<< "$pat_hits"
+                    fi
+                fi
+            done
+        fi
+    fi
 
     # ══════════════════════════════════════════════════════════════════════
     #  TASK COMPLETED
